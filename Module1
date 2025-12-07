@@ -114,6 +114,7 @@ Private Sub LoadManifestDataIntoCache(ws As Worksheet)
     Dim rowIndices As Collection
     
     Application.StatusBar = "Building data index for fast lookups..."
+    DoEvents  ' Refresh status bar display
     
     For i = 2 To lastRow
         ' Read from cached array (columns: B=2, C=3, D=4, G=7, H=8, K=11)
@@ -141,8 +142,8 @@ Private Sub LoadManifestDataIntoCache(ws As Worksheet)
             variationIndex(variationKey).Add i
         End If
         
-        ' Yield every 500 rows (less frequent = faster)
-        If i Mod 500 = 0 Then DoEvents
+        ' Yield every 100 rows to keep Excel responsive
+        If i Mod 100 = 0 Then DoEvents
     Next i
     
     cachedDataLoaded = True
@@ -289,9 +290,7 @@ Sub GeneratePricingSummary()
     For Each modelKey In uniqueModels
         modelCount = modelCount + 1
         Application.StatusBar = "Processing model " & modelCount & " of " & uniqueModels.Count & "..."
-        
-        ' Yield every 5 models to keep responsive
-        If modelCount Mod 5 = 0 Then DoEvents
+        DoEvents  ' CRITICAL: Refresh status bar and keep Excel responsive for EVERY model
         
         ' Process Headers1 section for this model (all colors included)
         currentRow = ProcessHeaders1SectionFast(wsSummary, CStr(modelKey), currentRow)
@@ -375,6 +374,7 @@ Function GetUniqueModels(ws As Worksheet) As Collection
     lastRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
     
     Application.StatusBar = "Scanning MANIFEST for unique models..."
+    DoEvents  ' Refresh status bar display
     
     On Error Resume Next
     For i = 2 To lastRow ' Assuming row 1 has headers
@@ -610,6 +610,7 @@ Function GetWholeCellCostFast(modelKey As String, grade As String, battery As St
         If Len(imei) > 0 Then
             totalIMEIsProcessed = totalIMEIsProcessed + 1
             Application.StatusBar = "Looking up IMEI " & totalIMEIsProcessed & ": " & Left(imei, 8) & "..."
+            DoEvents  ' CRITICAL: Must call DoEvents after StatusBar update to refresh display and keep Excel responsive
             
             ' Check cache first
             If costCache.Exists(imei) Then
@@ -1142,6 +1143,7 @@ Function GetWholeCellCostForGrade(ws As Worksheet, model As String, storage As S
             If Len(imei) > 0 Then
                 totalIMEIsProcessed = totalIMEIsProcessed + 1
                 Application.StatusBar = "Looking up IMEI " & totalIMEIsProcessed & ": " & Left(imei, 8) & "..."
+                DoEvents  ' CRITICAL: Must call DoEvents after StatusBar update to refresh display and keep Excel responsive
 
                 On Error Resume Next
                 If costCache.Exists(imei) Then
