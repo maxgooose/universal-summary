@@ -27,6 +27,14 @@ Private totalIMEIsProcessed As Long
 Private totalIMEIsFound As Long
 Private totalIMEIsNotFound As Long
 
+' =============================================
+' PERFORMANCE: Cached data structures (loaded once)
+' =============================================
+Private cachedManifestData As Variant       ' 2D array of all MANIFEST data
+Private cachedDataLoaded As Boolean         ' Flag to track if data is loaded
+Private modelIndex As Object                ' Dictionary: modelKey -> Collection of row indices
+Private variationIndex As Object            ' Dictionary: modelKey|grade|battery|color -> Collection of row indices
+
 ' Safe type conversion functions (following Module1 approach)
 Private Function CDbl0(ByVal v As Variant) As Double
     On Error Resume Next
@@ -70,9 +78,123 @@ End Function
 ' Sleep in milliseconds without API declares - keeps Excel responsive
 Private Sub SleepMs(ByVal ms As Long)
     Dim t As Single: t = Timer
-    Do While (Timer - t) * 1000 < ms
+    Dim elapsed As Single
+    Do
+        elapsed = Timer - t
+        ' Handle midnight rollover
+        If elapsed < 0 Then elapsed = elapsed + 86400
+        If elapsed * 1000 >= ms Then Exit Do
         DoEvents  ' Allow user to interact with Excel during wait
     Loop
+End Sub
+
+' =============================================
+' PERFORMANCE: Load all MANIFEST data into memory ONCE
+' =============================================
+Private Sub LoadManifestDataIntoCache(ws As Worksheet)
+    Dim lastRow As Long, lastCol As Long
+    Dim dataRange As Range
+    
+    ' Find data bounds
+    lastRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
+    If lastRow < 2 Then lastRow = 2
+    lastCol = 14 ' Columns A through N (we need up to column K for color, column H for battery, etc.)
+    
+    ' Load entire range into array (MUCH faster than cell-by-cell)
+    Set dataRange = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol))
+    cachedManifestData = dataRange.Value
+    
+    ' Build indexes for fast lookups
+    Set modelIndex = CreateObject("Scripting.Dictionary")
+    Set variationIndex = CreateObject("Scripting.Dictionary")
+    
+    Dim i As Long
+    Dim model As String, storage As String, grade As String, battery As String, color As String
+    Dim modelKey As String, variationKey As String
+    Dim rowIndices As Collection
+    
+    Application.StatusBar = "Building data index for fast lookups..."
+    
+    For i = 2 To lastRow
+        ' Read from cached array (columns: B=2, C=3, D=4, G=7, H=8, K=11)
+        model = Trim(CStr(Nz(cachedManifestData(i, 2), "")))
+        storage = ExtractStorageFast(CStr(Nz(cachedManifestData(i, 3), "")))
+        grade = Trim(CStr(Nz(cachedManifestData(i, 7), "")))
+        battery = Trim(CStr(Nz(cachedManifestData(i, 8), "")))
+        color = Trim(CStr(Nz(cachedManifestData(i, 11), "")))
+        
+        If model <> "" And storage <> "" Then
+            ' Build model index (Model + Storage)
+            modelKey = model & "|" & storage
+            If Not modelIndex.Exists(modelKey) Then
+                Set rowIndices = New Collection
+                modelIndex.Add modelKey, rowIndices
+            End If
+            modelIndex(modelKey).Add i
+            
+            ' Build variation index (Model + Storage + Grade + Battery + Color)
+            variationKey = modelKey & "|" & grade & "|" & battery & "|" & color
+            If Not variationIndex.Exists(variationKey) Then
+                Set rowIndices = New Collection
+                variationIndex.Add variationKey, rowIndices
+            End If
+            variationIndex(variationKey).Add i
+        End If
+        
+        ' Yield every 500 rows (less frequent = faster)
+        If i Mod 500 = 0 Then DoEvents
+    Next i
+    
+    cachedDataLoaded = True
+End Sub
+
+' Fast storage extraction (no regex - regex is slow)
+Private Function ExtractStorageFast(description As String) As String
+    Dim i As Long, j As Long
+    Dim char As String
+    Dim numStart As Long
+    Dim inNumber As Boolean
+    
+    description = UCase(description)
+    numStart = 0
+    inNumber = False
+    
+    For i = 1 To Len(description)
+        char = Mid(description, i, 1)
+        If char >= "0" And char <= "9" Then
+            If Not inNumber Then
+                numStart = i
+                inNumber = True
+            End If
+        ElseIf inNumber Then
+            ' Check if followed by GB
+            If i + 1 <= Len(description) Then
+                If Mid(description, i, 2) = "GB" Then
+                    ExtractStorageFast = Mid(description, numStart, i - numStart) & "GB"
+                    Exit Function
+                End If
+            End If
+            inNumber = False
+        End If
+    Next i
+    
+    ' Check end of string
+    If inNumber And Len(description) >= 2 Then
+        If Right(description, 2) = "GB" Then
+            ExtractStorageFast = Mid(description, numStart)
+            Exit Function
+        End If
+    End If
+    
+    ExtractStorageFast = ""
+End Function
+
+' Clear cached data (call at end of processing)
+Private Sub ClearManifestCache()
+    cachedDataLoaded = False
+    Erase cachedManifestData
+    Set modelIndex = Nothing
+    Set variationIndex = Nothing
 End Sub
 
 ' Main procedure - triggered by button on MANIFEST sheet
@@ -82,6 +204,10 @@ Sub GeneratePricingSummary()
     Dim uniqueModels As Collection
     Dim currentRow As Long
     Dim i As Long
+    Dim startTime As Single
+    
+    ' Track execution time
+    startTime = Timer
     
     ' Keep Excel responsive during processing
     DoEvents
@@ -92,11 +218,6 @@ Sub GeneratePricingSummary()
     ' Initialize cost cache (with error handling)
     On Error Resume Next
     Set costCache = CreateObject("Scripting.Dictionary")
-    If costCache Is Nothing Then
-        ' Fallback: Create a simple cache mechanism if Dictionary isn't available
-        MsgBox "Warning: Cost caching disabled. Some API calls may be redundant.", vbInformation
-        Set costCache = CreateObject("Scripting.Dictionary") ' Will fail gracefully in later code
-    End If
     On Error GoTo 0
     
     ' Initialize rate limiting collection
@@ -108,7 +229,13 @@ Sub GeneratePricingSummary()
     totalIMEIsNotFound = 0
     
     ' Validate that we're working from MANIFEST sheet
+    On Error Resume Next
     Set wsManifest = ActiveWorkbook.Sheets("MANIFEST")
+    If wsManifest Is Nothing Then
+        MsgBox "MANIFEST sheet not found!", vbExclamation, "Error"
+        Exit Sub
+    End If
+    On Error GoTo 0
     
     ' Check if MANIFEST has data
     If wsManifest.Cells(2, 2).Value = "" Then
@@ -116,12 +243,7 @@ Sub GeneratePricingSummary()
         Exit Sub
     End If
     
-    ' Show progress message - user can still interact with Excel
-    Application.StatusBar = "Generating pricing summary... (you can continue working)"
-    ' Keep ScreenUpdating ON so user can see progress and interact with Excel
-    Application.ScreenUpdating = True
-    
-    ' Create or clear summary sheet
+    ' Create or clear summary sheet BEFORE disabling screen updates
     On Error Resume Next
     Set wsSummary = ActiveWorkbook.Sheets("Summary of pricing")
     If wsSummary Is Nothing Then
@@ -136,11 +258,29 @@ Sub GeneratePricingSummary()
     End If
     On Error GoTo 0
     
+    ' =============================================
+    ' PERFORMANCE: Disable screen updates & auto-calc
+    ' =============================================
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    On Error GoTo CleanupOnError
+    
+    ' Show progress message
+    Application.StatusBar = "Loading MANIFEST data into memory..."
+    DoEvents
+    
+    ' =============================================
+    ' PERFORMANCE: Load all data into memory ONCE
+    ' =============================================
+    Call LoadManifestDataIntoCache(wsManifest)
+    
     ' Initialize starting row
     currentRow = 1
     
-    ' Get unique model combinations from MANIFEST (now grouped by Model + Storage only)
-    Set uniqueModels = GetUniqueModels(wsManifest)
+    ' Get unique model combinations from cache (instant - no sheet scanning)
+    Set uniqueModels = GetUniqueModelsFast()
     
     ' Process each unique model combination
     Dim modelKey As Variant
@@ -148,35 +288,48 @@ Sub GeneratePricingSummary()
     modelCount = 0
     For Each modelKey In uniqueModels
         modelCount = modelCount + 1
-        Application.StatusBar = "Processing model " & modelCount & " of " & uniqueModels.count & ": Fetching WholeCell costs..."
+        Application.StatusBar = "Processing model " & modelCount & " of " & uniqueModels.Count & "..."
         
-        ' Keep Excel responsive - critical for long operations
-        DoEvents
+        ' Yield every 5 models to keep responsive
+        If modelCount Mod 5 = 0 Then DoEvents
         
         ' Process Headers1 section for this model (all colors included)
-        currentRow = ProcessHeaders1Section(wsManifest, wsSummary, CStr(modelKey), currentRow)
-        
-        ' Keep Excel responsive between sections
-        DoEvents
+        currentRow = ProcessHeaders1SectionFast(wsSummary, CStr(modelKey), currentRow)
         
         ' Process Headers2 section (summary for this model)
         currentRow = ProcessHeaders2Section(wsSummary, currentRow)
         
         ' Add empty row between models
         currentRow = currentRow + 1
-        
-        ' Yield control periodically to prevent freezing
-        DoEvents
     Next modelKey
     
     ' Format the summary sheet
     Call FormatSummarySheet(wsSummary)
     
-    ' Reset status bar (screen updating was kept ON throughout)
+    ' =============================================
+    ' PERFORMANCE: Re-enable Excel features
+    ' =============================================
+CleanupOnError:
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
     Application.StatusBar = False
+    
+    ' Clear the cache to free memory
+    Call ClearManifestCache
+    
+    If Err.Number <> 0 Then
+        MsgBox "Error occurred: " & Err.Description, vbCritical, "Error"
+        Exit Sub
+    End If
     
     ' Switch to the summary sheet to show results
     wsSummary.Activate
+    
+    ' Calculate execution time
+    Dim elapsedTime As Single
+    elapsedTime = Timer - startTime
+    If elapsedTime < 0 Then elapsedTime = elapsedTime + 86400 ' Handle midnight
     
     ' Show detailed statistics about IMEI lookups
     Dim statsMsg As String
@@ -189,7 +342,8 @@ Sub GeneratePricingSummary()
                "  [-] Not Found: " & totalIMEIsNotFound & " IMEIs" & vbNewLine & _
                "================================" & vbNewLine & _
                "Total Processed: " & totalIMEIsProcessed & " IMEIs" & vbNewLine & vbNewLine & _
-               "Models Processed: " & uniqueModels.count
+               "Models Processed: " & uniqueModels.Count & vbNewLine & _
+               "Execution Time: " & Format(elapsedTime, "0.0") & " seconds"
     
     ' Set icon based on results
     If totalIMEIsNotFound > 0 Then
@@ -206,13 +360,19 @@ End Sub
 ' Function to get unique model combinations (Model + Storage ONLY - all colors grouped together)
 ' Different GBs (storage) belong to different groups
 Function GetUniqueModels(ws As Worksheet) As Collection
+    ' PERFORMANCE: Use cached version if available
+    If cachedDataLoaded Then
+        Set GetUniqueModels = GetUniqueModelsFast()
+        Exit Function
+    End If
+    
     Dim uniqueModels As New Collection
     Dim lastRow As Long
     Dim i As Long
     Dim modelKey As String
     Dim model As String, storage As String
     
-    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    lastRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
     
     Application.StatusBar = "Scanning MANIFEST for unique models..."
     
@@ -236,23 +396,267 @@ Function GetUniqueModels(ws As Worksheet) As Collection
     Set GetUniqueModels = uniqueModels
 End Function
 
+' PERFORMANCE: Fast version using pre-built index (instant lookup)
+Function GetUniqueModelsFast() As Collection
+    Dim uniqueModels As New Collection
+    Dim key As Variant
+    
+    If modelIndex Is Nothing Then
+        Set GetUniqueModelsFast = uniqueModels
+        Exit Function
+    End If
+    
+    ' Simply return all keys from the model index
+    For Each key In modelIndex.Keys
+        uniqueModels.Add key, CStr(key)
+    Next key
+    
+    Set GetUniqueModelsFast = uniqueModels
+End Function
+
 ' Extract storage from description field
+' PERFORMANCE: Uses fast string parsing instead of slow regex
 Function ExtractStorage(description As String) As String
-    Dim regex As Object
-    Dim matches As Object
+    ExtractStorage = ExtractStorageFast(CStr(description))
+End Function
+
+' PERFORMANCE: Fast version of ProcessHeaders1Section using cached data
+Function ProcessHeaders1SectionFast(wsSummary As Worksheet, modelKey As String, startRow As Long) As Long
+    Dim modelParts() As String
+    Dim model As String, storage As String
+    Dim currentRow As Long
+    Dim variationKeys As Object ' Dictionary to collect unique variations
+    Dim rowIndices As Collection
+    Dim idx As Variant
+    Dim grade As String, battery As String, color As String
+    Dim variationKey As String
+    Dim v As Variant
     
-    Set regex = CreateObject("VBScript.RegExp")
-    regex.Pattern = "(\d+GB)"
-    regex.IgnoreCase = True
+    modelParts = Split(modelKey, "|")
+    If UBound(modelParts) < 1 Then
+        ProcessHeaders1SectionFast = startRow
+        Exit Function
+    End If
+    model = modelParts(0)
+    storage = modelParts(1)
     
-    Set matches = regex.Execute(description)
-    If matches.count > 0 Then
-        ExtractStorage = matches(0).Value
+    currentRow = startRow
+    
+    ' Write Headers1
+    wsSummary.Cells(currentRow, 1).Value = "Model + Storage + Battery status + Grade + Color"
+    wsSummary.Cells(currentRow, 2).Value = "Qty"
+    wsSummary.Cells(currentRow, 3).Value = "Cost"
+    wsSummary.Cells(currentRow, 4).Value = "Extended Cost"
+    wsSummary.Cells(currentRow, 5).Value = "" ' Empty column
+    wsSummary.Cells(currentRow, 6).Value = "Multiplier"
+    wsSummary.Cells(currentRow, 7).Value = "Suggested Wholesale"
+    wsSummary.Cells(currentRow, 8).Value = "Suggested Extended"
+    wsSummary.Cells(currentRow, 9).Value = "" ' Empty column
+    wsSummary.Cells(currentRow, 10).Value = "Free hand Multiplier"
+    wsSummary.Cells(currentRow, 11).Value = "Final whole sale"
+    wsSummary.Cells(currentRow, 12).Value = "Final extended"
+    wsSummary.Cells(currentRow, 13).Value = "Notes"
+    
+    ' Format header row
+    With wsSummary.Range(wsSummary.Cells(currentRow, 1), wsSummary.Cells(currentRow, 13))
+        .Borders.LineStyle = xlContinuous
+    End With
+    
+    currentRow = currentRow + 1
+    
+    ' Get unique variations for this model from the pre-built index
+    Set variationKeys = CreateObject("Scripting.Dictionary")
+    
+    If modelIndex.Exists(modelKey) Then
+        Set rowIndices = modelIndex(modelKey)
+        For Each idx In rowIndices
+            ' Read from cached array
+            grade = Trim(CStr(Nz(cachedManifestData(idx, 7), "")))
+            battery = Trim(CStr(Nz(cachedManifestData(idx, 8), "")))
+            color = Trim(CStr(Nz(cachedManifestData(idx, 11), "")))
+            variationKey = grade & "|" & battery & "|" & color
+            If Not variationKeys.Exists(variationKey) Then
+                variationKeys.Add variationKey, variationKey
+            End If
+        Next idx
+    End If
+    
+    ' Process each variation
+    For Each v In variationKeys.Keys
+        Dim vParts() As String
+        vParts = Split(CStr(v), "|")
+        If UBound(vParts) >= 2 Then
+            grade = vParts(0)
+            battery = vParts(1)
+            color = vParts(2)
+            
+            ' Get cost using fast lookup
+            Dim avgCost As Variant
+            avgCost = GetWholeCellCostFast(modelKey, grade, battery, color)
+            
+            ' Only write row if valid pricing
+            If Not IsError(avgCost) And CDbl0(avgCost) > 0 Then
+                ' Get quantity using fast lookup
+                Dim qty As Long
+                qty = GetQuantityFast(modelKey, grade, battery, color)
+                
+                ' Write data row
+                wsSummary.Cells(currentRow, 1).Value = model & " " & storage & " " & battery & " " & grade & " " & color
+                wsSummary.Cells(currentRow, 2).Value = qty
+                wsSummary.Cells(currentRow, 3).Value = avgCost
+                wsSummary.Cells(currentRow, 3).NumberFormat = "$#,##0.00"
+                wsSummary.Cells(currentRow, 3).Interior.color = RGB(255, 255, 0)
+                wsSummary.Cells(currentRow, 4).Formula = "=B" & currentRow & "*C" & currentRow
+                wsSummary.Cells(currentRow, 4).NumberFormat = "$#,##0.00"
+                
+                ' Multiplier
+                Dim multiplier As Double
+                multiplier = GetMultiplier(grade)
+                wsSummary.Cells(currentRow, 6).Value = multiplier
+                wsSummary.Cells(currentRow, 6).NumberFormat = "0.00"
+                wsSummary.Cells(currentRow, 6).Interior.color = RGB(146, 208, 80)
+                
+                ' Battery deduction
+                Dim batteryDeduction As Double
+                Dim suggestedPrice As Double
+                Dim isBadBattery As Boolean
+                
+                suggestedPrice = avgCost * multiplier
+                isBadBattery = IsBatteryDefective(grade, battery)
+                
+                If isBadBattery Then
+                    batteryDeduction = 15
+                    suggestedPrice = suggestedPrice - batteryDeduction
+                    Dim totalBatteryDeduction As Double
+                    totalBatteryDeduction = batteryDeduction * qty
+                    wsSummary.Cells(currentRow, 13).Value = " (Battery deduction: -$" & Format(totalBatteryDeduction, "#,##0.00") & " total, -$15 per unit)"
+                    wsSummary.Cells(currentRow, 13).Font.color = RGB(255, 0, 0)
+                    wsSummary.Cells(currentRow, 13).Font.Bold = True
+                End If
+                
+                wsSummary.Cells(currentRow, 7).Value = suggestedPrice
+                wsSummary.Cells(currentRow, 7).NumberFormat = "$#,##0.00"
+                wsSummary.Cells(currentRow, 7).Interior.color = RGB(255, 255, 0)
+                wsSummary.Cells(currentRow, 8).Formula = "=B" & currentRow & "*G" & currentRow
+                wsSummary.Cells(currentRow, 8).NumberFormat = "$#,##0.00"
+                wsSummary.Cells(currentRow, 8).Interior.color = RGB(255, 255, 0)
+                
+                ' Free hand columns
+                wsSummary.Cells(currentRow, 10).Interior.color = RGB(142, 169, 219)
+                wsSummary.Cells(currentRow, 10).NumberFormat = "0.00"
+                wsSummary.Cells(currentRow, 14).Value = IIf(isBadBattery, "BAD_BATTERY", "GOOD_BATTERY")
+                wsSummary.Cells(currentRow, 14).Font.color = wsSummary.Cells(currentRow, 14).Interior.color
+                
+                If isBadBattery Then
+                    wsSummary.Cells(currentRow, 11).Formula = "=IF(ISNUMBER(J" & currentRow & "),C" & currentRow & "*J" & currentRow & "-15,G" & currentRow & ")"
+                Else
+                    wsSummary.Cells(currentRow, 11).Formula = "=IF(ISNUMBER(J" & currentRow & "),C" & currentRow & "*J" & currentRow & ",G" & currentRow & ")"
+                End If
+                wsSummary.Cells(currentRow, 11).NumberFormat = "$#,##0.00"
+                wsSummary.Cells(currentRow, 11).Interior.color = RGB(142, 169, 219)
+                wsSummary.Cells(currentRow, 12).Formula = "=B" & currentRow & "*K" & currentRow
+                wsSummary.Cells(currentRow, 12).NumberFormat = "$#,##0.00"
+                wsSummary.Cells(currentRow, 12).Interior.color = RGB(142, 169, 219)
+                
+                wsSummary.Range(wsSummary.Cells(currentRow, 1), wsSummary.Cells(currentRow, 13)).Borders.LineStyle = xlContinuous
+                currentRow = currentRow + 1
+            End If
+        End If
+    Next v
+    
+    ProcessHeaders1SectionFast = currentRow
+End Function
+
+' PERFORMANCE: Fast quantity lookup using index
+Function GetQuantityFast(modelKey As String, grade As String, battery As String, color As String) As Long
+    Dim fullKey As String
+    Dim count As Long
+    
+    fullKey = modelKey & "|" & grade & "|" & battery & "|" & color
+    count = 0
+    
+    If variationIndex.Exists(fullKey) Then
+        count = variationIndex(fullKey).Count
+    End If
+    
+    GetQuantityFast = count
+End Function
+
+' PERFORMANCE: Fast cost lookup using index and cached data
+Function GetWholeCellCostFast(modelKey As String, grade As String, battery As String, color As String) As Variant
+    Dim fullKey As String
+    Dim rowIndices As Collection
+    Dim idx As Variant
+    Dim imei As String
+    Dim costs As Collection
+    Dim cost As Variant
+    Dim totalCost As Double
+    Dim i As Long
+    
+    fullKey = modelKey & "|" & grade & "|" & battery & "|" & color
+    Set costs = New Collection
+    
+    If Not variationIndex.Exists(fullKey) Then
+        GetWholeCellCostFast = CVErr(xlErrNA)
+        Exit Function
+    End If
+    
+    Set rowIndices = variationIndex(fullKey)
+    
+    For Each idx In rowIndices
+        ' Read IMEI from cached array (column D = 4)
+        imei = Trim(CStr(Nz(cachedManifestData(idx, 4), "")))
+        
+        If Len(imei) > 0 Then
+            totalIMEIsProcessed = totalIMEIsProcessed + 1
+            Application.StatusBar = "Looking up IMEI " & totalIMEIsProcessed & ": " & Left(imei, 8) & "..."
+            
+            ' Check cache first
+            If costCache.Exists(imei) Then
+                cost = costCache(imei)
+            Else
+                ' Enforce rate limit
+                EnforceRateLimit
+                
+                ' Fetch from WholeCell
+                Dim dict As Object
+                Set dict = FetchWithRetry(imei, 2)
+                DoEvents
+                
+                If Not dict Is Nothing Then
+                    If CBool(Nz(dict("success"), False)) Then
+                        cost = CDbl0(dict("universalUsd"))
+                        If cost > 0 Then costCache.Add imei, cost
+                    Else
+                        cost = 0
+                    End If
+                Else
+                    cost = 0
+                End If
+            End If
+            
+            If CDbl0(cost) > 0 Then
+                costs.Add cost
+                totalIMEIsFound = totalIMEIsFound + 1
+            Else
+                totalIMEIsNotFound = totalIMEIsNotFound + 1
+            End If
+        End If
+    Next idx
+    
+    ' Calculate average
+    If costs.Count > 0 Then
+        totalCost = 0
+        For i = 1 To costs.Count
+            totalCost = totalCost + costs(i)
+        Next i
+        GetWholeCellCostFast = totalCost / costs.Count
     Else
-        ExtractStorage = ""
+        GetWholeCellCostFast = CVErr(xlErrNA)
     End If
 End Function
 
+' Original version kept for compatibility
 ' Process Headers1 section for a specific model (includes all colors for same Model + Storage)
 Function ProcessHeaders1Section(wsManifest As Worksheet, wsSummary As Worksheet, modelKey As String, startRow As Long) As Long
     Dim modelParts() As String
@@ -538,31 +942,52 @@ Function IsBatteryDefective(grade As String, batteryHealth As String) As Boolean
 End Function
 
 ' Get grade/battery/color variations for a specific model+storage (all colors included)
+' PERFORMANCE: Uses cached data when available
 Function GetGradeVariationsForModel(ws As Worksheet, model As String, storage As String) As Collection
     Dim variations As New Collection
-    Dim lastRow As Long
-    Dim i As Long
-    Dim currentModel As String, currentStorage As String
+    Dim modelKey As String
+    Dim rowIndices As Collection
+    Dim idx As Variant
     Dim grade As String, battery As String, color As String
     Dim variationKey As String
     
-    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    ' Use cached data if available (MUCH faster)
+    If cachedDataLoaded And Not modelIndex Is Nothing Then
+        modelKey = model & "|" & storage
+        If modelIndex.Exists(modelKey) Then
+            Set rowIndices = modelIndex(modelKey)
+            On Error Resume Next
+            For Each idx In rowIndices
+                grade = Trim(CStr(Nz(cachedManifestData(idx, 7), "")))
+                battery = Trim(CStr(Nz(cachedManifestData(idx, 8), "")))
+                color = Trim(CStr(Nz(cachedManifestData(idx, 11), "")))
+                variationKey = grade & "|" & battery & "|" & color
+                variations.Add variationKey, variationKey
+            Next idx
+            On Error GoTo 0
+        End If
+        Set GetGradeVariationsForModel = variations
+        Exit Function
+    End If
+    
+    ' Fallback to original method if cache not available
+    Dim lastRow As Long
+    Dim i As Long
+    Dim currentModel As String, currentStorage As String
+    
+    lastRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
     
     On Error Resume Next
     For i = 2 To lastRow
-        ' Keep Excel responsive - yield every 50 rows
-        If i Mod 50 = 0 Then DoEvents
+        If i Mod 100 = 0 Then DoEvents
         
-        currentModel = Trim(ws.Cells(i, 2).Value) ' Column B: MODEL
-        currentStorage = ExtractStorage(ws.Cells(i, 3).Value) ' Column C: DESCRIPTION
+        currentModel = Trim(ws.Cells(i, 2).Value)
+        currentStorage = ExtractStorage(ws.Cells(i, 3).Value)
         
-        ' Match by Model + Storage only (all colors included in same group)
         If currentModel = model And currentStorage = storage Then
-            grade = Trim(ws.Cells(i, 7).Value) ' Column G: GRADE
-            battery = Trim(ws.Cells(i, 8).Value) ' Column H: BATTERY HEALTH
-            color = Trim(ws.Cells(i, 11).Value) ' Column K: COLOR
-            
-            ' Include color in the variation key
+            grade = Trim(ws.Cells(i, 7).Value)
+            battery = Trim(ws.Cells(i, 8).Value)
+            color = Trim(ws.Cells(i, 11).Value)
             variationKey = grade & "|" & battery & "|" & color
             variations.Add variationKey, variationKey
         End If
@@ -578,19 +1003,26 @@ Function GetGradesForModel(ws As Worksheet, model As String, storage As String, 
 End Function
 
 ' Get quantity for specific grade/battery/color combination
+' PERFORMANCE: Uses cached index when available
 Function GetQuantityForGrade(ws As Worksheet, model As String, storage As String, color As String, grade As String, battery As String) As Long
+    ' Use fast cached version if available
+    If cachedDataLoaded And Not variationIndex Is Nothing Then
+        GetQuantityForGrade = GetQuantityFast(model & "|" & storage, grade, battery, color)
+        Exit Function
+    End If
+    
+    ' Fallback to original method
     Dim lastRow As Long
     Dim i As Long
     Dim count As Long
     Dim currentModel As String, currentStorage As String, currentColor As String
     Dim currentGrade As String, currentBattery As String
     
-    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    lastRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
     count = 0
     
     For i = 2 To lastRow
-        ' Keep Excel responsive - yield every 50 rows
-        If i Mod 50 = 0 Then DoEvents
+        If i Mod 100 = 0 Then DoEvents
         
         currentModel = Trim(ws.Cells(i, 2).Value)
         currentStorage = ExtractStorage(ws.Cells(i, 3).Value)
@@ -670,7 +1102,15 @@ Private Sub EnforceRateLimit()
 End Sub
 
 ' Get average WholeCell cost for a specific model/grade combination
+' PERFORMANCE: Uses cached index when available
 Function GetWholeCellCostForGrade(ws As Worksheet, model As String, storage As String, color As String, grade As String, battery As String) As Variant
+    ' Use fast cached version if available
+    If cachedDataLoaded And Not variationIndex Is Nothing Then
+        GetWholeCellCostForGrade = GetWholeCellCostFast(model & "|" & storage, grade, battery, color)
+        Exit Function
+    End If
+    
+    ' Fallback to original method
     Dim lastRow As Long
     Dim i As Long
     Dim currentModel As String, currentStorage As String, currentColor As String
@@ -682,66 +1122,49 @@ Function GetWholeCellCostForGrade(ws As Worksheet, model As String, storage As S
     Dim loopCounter As Long
     
     Set costs = New Collection
-    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    lastRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
     loopCounter = 0
     
-    ' Find matching items and fetch their costs from WholeCell
     For i = 2 To lastRow
-        ' Keep Excel responsive - yield every 10 iterations
         loopCounter = loopCounter + 1
-        If loopCounter Mod 10 = 0 Then DoEvents
-        currentModel = Trim(ws.Cells(i, 2).Value) ' Column B: MODEL
-        currentStorage = ExtractStorage(ws.Cells(i, 3).Value) ' Column C: DESCRIPTION
-        currentColor = Trim(ws.Cells(i, 11).Value) ' Column K: COLOR
-        currentGrade = Trim(ws.Cells(i, 7).Value) ' Column G: GRADE
-        currentBattery = Trim(ws.Cells(i, 8).Value) ' Column H: BATTERY HEALTH
+        If loopCounter Mod 50 = 0 Then DoEvents
+        
+        currentModel = Trim(ws.Cells(i, 2).Value)
+        currentStorage = ExtractStorage(ws.Cells(i, 3).Value)
+        currentColor = Trim(ws.Cells(i, 11).Value)
+        currentGrade = Trim(ws.Cells(i, 7).Value)
+        currentBattery = Trim(ws.Cells(i, 8).Value)
         
         If currentModel = model And currentStorage = storage And currentColor = color And _
            currentGrade = grade And currentBattery = battery Then
-            ' Get IMEI from Column D
             imei = Trim(ws.Cells(i, 4).Value)
             
-            ' Fetch cost from WholeCell using the IMEI (following Module1 safe approach)
             If Len(imei) > 0 Then
                 totalIMEIsProcessed = totalIMEIsProcessed + 1
-                
-                ' Update status bar with IMEI progress
                 Application.StatusBar = "Looking up IMEI " & totalIMEIsProcessed & ": " & Left(imei, 8) & "..."
 
                 On Error Resume Next
-                ' Check cache first
-                Dim isCached As Boolean
-                isCached = costCache.Exists(imei)
-
-                If isCached Then
+                If costCache.Exists(imei) Then
                     cost = costCache(imei)
                 Else
-                    ' Enforce rate limit before making API call (max 2 calls per second)
                     EnforceRateLimit
-
-                    ' Fetch from WholeCell using Module1's safe approach
                     Dim dict As Object
-                    Set dict = FetchWithRetry(imei, 2) ' 2 retries like Module1
-                    
-                    ' Keep Excel responsive after API call
+                    Set dict = FetchWithRetry(imei, 2)
                     DoEvents
 
                     If Not dict Is Nothing Then
                         If CBool(Nz(dict("success"), False)) Then
-                            cost = CDbl0(dict("universalUsd")) ' Safe conversion like Module1
-                            If cost > 0 Then
-                                costCache.Add imei, cost
-                            End If
+                            cost = CDbl0(dict("universalUsd"))
+                            If cost > 0 Then costCache.Add imei, cost
                         Else
-                            cost = 0 ' Failed fetch
+                            cost = 0
                         End If
                     Else
-                        cost = 0 ' No response
+                        cost = 0
                     End If
                 End If
                 On Error GoTo 0
-                ' check if the module is there
-                ' Track statistics using safe conversion (like Module1)
+                
                 If CDbl0(cost) > 0 Then
                     costs.Add cost
                     totalIMEIsFound = totalIMEIsFound + 1
@@ -752,15 +1175,13 @@ Function GetWholeCellCostForGrade(ws As Worksheet, model As String, storage As S
         End If
     Next i
     
-    ' Calculate average cost - NO FALLBACK, return error if no valid prices
-    If costs.count > 0 Then
+    If costs.Count > 0 Then
         totalCost = 0
-        For i = 1 To costs.count
+        For i = 1 To costs.Count
             totalCost = totalCost + costs(i)
         Next i
-        GetWholeCellCostForGrade = totalCost / costs.count
+        GetWholeCellCostForGrade = totalCost / costs.Count
     Else
-        ' Return an error value if no costs found - NO $70 FALLBACK
         GetWholeCellCostForGrade = CVErr(xlErrNA)
     End If
 End Function
