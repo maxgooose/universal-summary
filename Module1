@@ -1,0 +1,1209 @@
+Attribute VB_Name = "Module1"
+
+' ===================================
+' PRICING SUMMARY GENERATOR MACRO
+' ===================================
+' This macro creates a structured pricing summary report from MANIFEST data
+' Button is placed on MANIFEST sheet - user enters all data there first
+' Then clicks button to generate the "Summary of pricing" sheet
+' Author: Harb
+' Version: 2.2 - Updated grouping: Headers1 groups by Model+Storage (all colors together)
+'               Headers2 shows "Model + Storage" as differentiator
+'  i want soup man
+' soup
+
+' ===================================
+
+Option Explicit
+
+' Global cache for WholeCell costs to avoid redundant API calls
+Private costCache As Object
+
+' Rate limiting variables - track API calls to ensure max 2 calls per second
+Private apiCallTimestamps As Collection
+
+' Statistics tracking for IMEI lookups (MUST be declared before subroutines)
+Private totalIMEIsProcessed As Long
+Private totalIMEIsFound As Long
+Private totalIMEIsNotFound As Long
+
+' Safe type conversion functions (following Module1 approach)
+Private Function CDbl0(ByVal v As Variant) As Double
+    On Error Resume Next
+    CDbl0 = CDbl(v)
+    If Err.Number <> 0 Then CDbl0 = 0#
+    On Error GoTo 0
+End Function
+
+' Null/empty-safe: returns replacement if value is Empty/Null/"".
+Private Function Nz(ByVal v As Variant, Optional ByVal replacement As Variant = "") As Variant
+    If IsError(v) Then
+        Nz = replacement
+    ElseIf IsMissing(v) Then
+        Nz = replacement
+    ElseIf IsNull(v) Then
+        Nz = replacement
+    ElseIf VarType(v) = vbString Then
+        If Len(v) = 0 Then Nz = replacement Else Nz = v
+    Else
+        If Len(Trim$(CStr(v))) = 0 Then Nz = replacement Else Nz = v
+    End If
+End Function
+
+' Fetch wrapper with retry/backoff (following Module1 approach)
+Private Function FetchWithRetry(ByVal imeiOrEsn As String, ByVal retries As Long) As Object
+    Dim i As Long, dict As Object
+    For i = 0 To retries
+        Set dict = WholeCellModule.WholeCellFetch(imeiOrEsn)
+        If Not dict Is Nothing Then
+            If CBool(Nz(dict("success"), False)) Then
+                Set FetchWithRetry = dict
+                Exit Function
+            End If
+        End If
+        DoEvents
+        SleepMs 300 * (i + 1)   ' simple backoff
+    Next i
+    Set FetchWithRetry = dict   ' return last attempt (may be Nothing or success=False)
+End Function
+
+' Sleep in milliseconds without API declares - keeps Excel responsive
+Private Sub SleepMs(ByVal ms As Long)
+    Dim t As Single: t = Timer
+    Do While (Timer - t) * 1000 < ms
+        DoEvents  ' Allow user to interact with Excel during wait
+    Loop
+End Sub
+
+' Main procedure - triggered by button on MANIFEST sheet
+Sub GeneratePricingSummary()
+    Dim wsManifest As Worksheet
+    Dim wsSummary As Worksheet
+    Dim uniqueModels As Collection
+    Dim currentRow As Long
+    Dim i As Long
+    
+    ' Keep Excel responsive during processing
+    DoEvents
+    
+    ' Set up event handler for the summary sheet
+    Call SetupSummarySheetEventHandler
+    
+    ' Initialize cost cache (with error handling)
+    On Error Resume Next
+    Set costCache = CreateObject("Scripting.Dictionary")
+    If costCache Is Nothing Then
+        ' Fallback: Create a simple cache mechanism if Dictionary isn't available
+        MsgBox "Warning: Cost caching disabled. Some API calls may be redundant.", vbInformation
+        Set costCache = CreateObject("Scripting.Dictionary") ' Will fail gracefully in later code
+    End If
+    On Error GoTo 0
+    
+    ' Initialize rate limiting collection
+    Set apiCallTimestamps = New Collection
+    
+    ' Initialize statistics tracking
+    totalIMEIsProcessed = 0
+    totalIMEIsFound = 0
+    totalIMEIsNotFound = 0
+    
+    ' Validate that we're working from MANIFEST sheet
+    Set wsManifest = ActiveWorkbook.Sheets("MANIFEST")
+    
+    ' Check if MANIFEST has data
+    If wsManifest.Cells(2, 2).Value = "" Then
+        MsgBox "Please enter data in the MANIFEST sheet before generating summary.", vbExclamation, "No Data Found"
+        Exit Sub
+    End If
+    
+    ' Show progress message - user can still interact with Excel
+    Application.StatusBar = "Generating pricing summary... (you can continue working)"
+    ' Keep ScreenUpdating ON so user can see progress and interact with Excel
+    Application.ScreenUpdating = True
+    
+    ' Create or clear summary sheet
+    On Error Resume Next
+    Set wsSummary = ActiveWorkbook.Sheets("Summary of pricing")
+    If wsSummary Is Nothing Then
+        Set wsSummary = ActiveWorkbook.Sheets.Add(After:=wsManifest)
+        wsSummary.Name = "Summary of pricing"
+    Else
+        ' Ask user if they want to overwrite existing summary
+        If MsgBox("Summary sheet already exists. Do you want to regenerate it?", vbYesNo + vbQuestion, "Overwrite Summary?") = vbNo Then
+            Exit Sub
+        End If
+        wsSummary.Cells.Clear
+    End If
+    On Error GoTo 0
+    
+    ' Initialize starting row
+    currentRow = 1
+    
+    ' Get unique model combinations from MANIFEST (now grouped by Model + Storage only)
+    Set uniqueModels = GetUniqueModels(wsManifest)
+    
+    ' Process each unique model combination
+    Dim modelKey As Variant
+    Dim modelCount As Long
+    modelCount = 0
+    For Each modelKey In uniqueModels
+        modelCount = modelCount + 1
+        Application.StatusBar = "Processing model " & modelCount & " of " & uniqueModels.count & ": Fetching WholeCell costs..."
+        
+        ' Keep Excel responsive - critical for long operations
+        DoEvents
+        
+        ' Process Headers1 section for this model (all colors included)
+        currentRow = ProcessHeaders1Section(wsManifest, wsSummary, CStr(modelKey), currentRow)
+        
+        ' Keep Excel responsive between sections
+        DoEvents
+        
+        ' Process Headers2 section (summary for this model)
+        currentRow = ProcessHeaders2Section(wsSummary, currentRow)
+        
+        ' Add empty row between models
+        currentRow = currentRow + 1
+        
+        ' Yield control periodically to prevent freezing
+        DoEvents
+    Next modelKey
+    
+    ' Format the summary sheet
+    Call FormatSummarySheet(wsSummary)
+    
+    ' Reset status bar (screen updating was kept ON throughout)
+    Application.StatusBar = False
+    
+    ' Switch to the summary sheet to show results
+    wsSummary.Activate
+    
+    ' Show detailed statistics about IMEI lookups
+    Dim statsMsg As String
+    Dim iconType As VbMsgBoxStyle
+    
+    statsMsg = "Pricing Summary Generated!" & vbNewLine & vbNewLine & _
+               "WholeCell IMEI Lookup Results:" & vbNewLine & _
+               "================================" & vbNewLine & _
+               "  [+] Found: " & totalIMEIsFound & " IMEIs" & vbNewLine & _
+               "  [-] Not Found: " & totalIMEIsNotFound & " IMEIs" & vbNewLine & _
+               "================================" & vbNewLine & _
+               "Total Processed: " & totalIMEIsProcessed & " IMEIs" & vbNewLine & vbNewLine & _
+               "Models Processed: " & uniqueModels.count
+    
+    ' Set icon based on results
+    If totalIMEIsNotFound > 0 Then
+        statsMsg = statsMsg & vbNewLine & vbNewLine & _
+                   "Note: Items without pricing were excluded from summary."
+        iconType = vbExclamation ' Warning icon
+    Else
+        iconType = vbInformation ' Info icon
+    End If
+    
+    MsgBox statsMsg, iconType, "Summary Complete"
+End Sub
+
+' Function to get unique model combinations (Model + Storage ONLY - all colors grouped together)
+' Different GBs (storage) belong to different groups
+Function GetUniqueModels(ws As Worksheet) As Collection
+    Dim uniqueModels As New Collection
+    Dim lastRow As Long
+    Dim i As Long
+    Dim modelKey As String
+    Dim model As String, storage As String
+    
+    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    
+    Application.StatusBar = "Scanning MANIFEST for unique models..."
+    
+    On Error Resume Next
+    For i = 2 To lastRow ' Assuming row 1 has headers
+        ' Keep Excel responsive - yield every 50 rows
+        If i Mod 50 = 0 Then DoEvents
+        
+        model = Trim(ws.Cells(i, 2).Value) ' Column B: MODEL
+        storage = ExtractStorage(ws.Cells(i, 3).Value) ' Column C: DESCRIPTION
+        
+        If model <> "" And storage <> "" Then
+            ' Group by Model + Storage ONLY (not by color)
+            ' Different GBs = different groups, all colors together
+            modelKey = model & "|" & storage
+            uniqueModels.Add modelKey, modelKey
+        End If
+    Next i
+    On Error GoTo 0
+    
+    Set GetUniqueModels = uniqueModels
+End Function
+
+' Extract storage from description field
+Function ExtractStorage(description As String) As String
+    Dim regex As Object
+    Dim matches As Object
+    
+    Set regex = CreateObject("VBScript.RegExp")
+    regex.Pattern = "(\d+GB)"
+    regex.IgnoreCase = True
+    
+    Set matches = regex.Execute(description)
+    If matches.count > 0 Then
+        ExtractStorage = matches(0).Value
+    Else
+        ExtractStorage = ""
+    End If
+End Function
+
+' Process Headers1 section for a specific model (includes all colors for same Model + Storage)
+Function ProcessHeaders1Section(wsManifest As Worksheet, wsSummary As Worksheet, modelKey As String, startRow As Long) As Long
+    Dim modelParts() As String
+    Dim model As String, storage As String
+    Dim gradeVariations As Collection
+    Dim currentRow As Long
+    Dim i As Long
+    
+    modelParts = Split(modelKey, "|")
+    model = modelParts(0)
+    storage = modelParts(1)
+    
+    currentRow = startRow
+    
+    ' Write Headers1
+    wsSummary.Cells(currentRow, 1).Value = "Model + Storage + Battery status + Grade + Color"
+    wsSummary.Cells(currentRow, 2).Value = "Qty"
+    wsSummary.Cells(currentRow, 3).Value = "Cost"
+    wsSummary.Cells(currentRow, 4).Value = "Extended Cost"
+    wsSummary.Cells(currentRow, 5).Value = "" ' Empty column
+    wsSummary.Cells(currentRow, 6).Value = "Multiplier"
+    wsSummary.Cells(currentRow, 7).Value = "Suggested Wholesale"
+    wsSummary.Cells(currentRow, 8).Value = "Suggested Extended"
+    wsSummary.Cells(currentRow, 9).Value = "" ' Empty column
+    wsSummary.Cells(currentRow, 10).Value = "Free hand Multiplier"
+    wsSummary.Cells(currentRow, 11).Value = "Final whole sale"
+    wsSummary.Cells(currentRow, 12).Value = "Final extended"
+    wsSummary.Cells(currentRow, 13).Value = "Notes" ' Battery deduction notes
+    
+    ' Format header row - NO COLOR for Headers1
+    With wsSummary.Range(wsSummary.Cells(currentRow, 1), wsSummary.Cells(currentRow, 13))
+        .Borders.LineStyle = xlContinuous
+        ' No background color for Headers1 row
+    End With
+    
+    currentRow = currentRow + 1
+    
+    ' Get unique grade/battery/color combinations for this model+storage (all colors included)
+    Set gradeVariations = GetGradeVariationsForModel(wsManifest, model, storage)
+    
+    ' Process each grade/battery/color variation
+    Dim variationKey As Variant
+    For Each variationKey In gradeVariations
+        ' Keep Excel responsive while processing grades
+        DoEvents
+        
+        Dim variationParts() As String
+        variationParts = Split(CStr(variationKey), "|")
+        ' variationParts(0) = grade, variationParts(1) = battery, variationParts(2) = color
+        
+        Dim grade As String, battery As String, color As String
+        grade = variationParts(0)
+        battery = variationParts(1)
+        color = variationParts(2)
+        
+        ' *** CRITICAL: Get cost first and only add row if pricing is available ***
+        Dim avgCost As Variant
+        avgCost = GetWholeCellCostForGrade(wsManifest, model, storage, color, grade, battery)
+
+        ' *** SAFE: Use Module1's approach - check if we got a valid price ***
+        ' Skip rows with no valid pricing (IMEs not found in WholeCell)
+        If Not IsError(avgCost) And CDbl0(avgCost) > 0 Then
+            ' Only write row if we have valid WholeCell pricing - NO FALLBACK
+            
+            ' Column A: Model + Storage + Battery status + Grade + Color
+            ' Format: "MODEL STORAGE BATTERY_GRADE COLOR"
+            wsSummary.Cells(currentRow, 1).Value = model & " " & storage & " " & battery & " " & grade & " " & color
+            
+            ' Column B: Qty
+            wsSummary.Cells(currentRow, 2).Value = GetQuantityForGrade(wsManifest, model, storage, color, grade, battery)
+            
+            ' Column C: Cost (fetched from Wholecell) - YELLOW
+            wsSummary.Cells(currentRow, 3).Value = avgCost
+            wsSummary.Cells(currentRow, 3).NumberFormat = "$#,##0.00"
+            wsSummary.Cells(currentRow, 3).Interior.color = RGB(255, 255, 0) ' Yellow for Wholecell data
+            
+            ' Column D: Extended Cost (Qty * Cost)
+            wsSummary.Cells(currentRow, 4).Formula = "=B" & currentRow & "*C" & currentRow
+            wsSummary.Cells(currentRow, 4).NumberFormat = "$#,##0.00"
+            
+            ' Column E: Empty
+            
+            ' Column F: Multiplier based on grade - GREEN
+            Dim multiplier As Double
+            multiplier = GetMultiplier(grade)
+            wsSummary.Cells(currentRow, 6).Value = multiplier
+            wsSummary.Cells(currentRow, 6).NumberFormat = "0.00"
+            wsSummary.Cells(currentRow, 6).Interior.color = RGB(146, 208, 80) ' Green for stable multiplier
+            
+            ' Column G: Suggested Wholesale (Cost * Multiplier - Battery Deduction) - YELLOW
+            ' Apply battery deduction if battery is not good
+            Dim batteryDeduction As Double
+            Dim suggestedPrice As Double
+            Dim batteryNote As String
+            Dim isBadBattery As Boolean
+            
+            ' Calculate base suggested price
+            suggestedPrice = wsSummary.Cells(currentRow, 3).Value * multiplier
+            
+            ' Check if battery is not good
+            isBadBattery = IsBatteryDefective(grade, battery)
+            
+            If isBadBattery Then
+                batteryDeduction = 15 ' $15 deduction per unit with bad battery
+                suggestedPrice = suggestedPrice - batteryDeduction
+                
+                ' Calculate total deduction for all units
+                Dim qty As Long
+                qty = wsSummary.Cells(currentRow, 2).Value
+                Dim totalBatteryDeduction As Double
+                totalBatteryDeduction = batteryDeduction * qty
+                
+                ' Add note about battery deduction in red
+                batteryNote = " (Battery deduction: -$" & Format(totalBatteryDeduction, "#,##0.00") & " total, -$15 per unit)"
+                
+                ' Add the note to column M or as a comment
+                wsSummary.Cells(currentRow, 13).Value = batteryNote
+                wsSummary.Cells(currentRow, 13).Font.color = RGB(255, 0, 0) ' Red text for the note
+                wsSummary.Cells(currentRow, 13).Font.Bold = True
+            End If
+            
+            wsSummary.Cells(currentRow, 7).Value = suggestedPrice
+            wsSummary.Cells(currentRow, 7).NumberFormat = "$#,##0.00"
+            wsSummary.Cells(currentRow, 7).Interior.color = RGB(255, 255, 0) ' Yellow
+            
+            ' Column H: Suggested Extended (Qty * Suggested Wholesale) - YELLOW
+            wsSummary.Cells(currentRow, 8).Formula = "=B" & currentRow & "*G" & currentRow
+            wsSummary.Cells(currentRow, 8).NumberFormat = "$#,##0.00"
+            wsSummary.Cells(currentRow, 8).Interior.color = RGB(255, 255, 0) ' Yellow
+            
+            ' Column I: Empty
+            
+            ' Column J: Free hand Multiplier (user input) - BLUE
+            wsSummary.Cells(currentRow, 10).Interior.color = RGB(142, 169, 219) ' Blue for user input
+            wsSummary.Cells(currentRow, 10).NumberFormat = "0.00"
+            
+            ' Store battery deduction info for VBA event handler (hidden column N)
+            wsSummary.Cells(currentRow, 14).Value = IIf(isBadBattery, "BAD_BATTERY", "GOOD_BATTERY")
+            wsSummary.Cells(currentRow, 14).Font.color = wsSummary.Cells(currentRow, 14).Interior.color ' Hide it
+            
+            ' Column K: Final whole sale (Cost * Free hand Multiplier - Battery Deduction) - BLUE
+            ' Formula: Calculate from J if J has value, otherwise use suggested price (G)
+            If isBadBattery Then
+                wsSummary.Cells(currentRow, 11).Formula = "=IF(ISNUMBER(J" & currentRow & "),C" & currentRow & "*J" & currentRow & "-15,G" & currentRow & ")"
+            Else
+                wsSummary.Cells(currentRow, 11).Formula = "=IF(ISNUMBER(J" & currentRow & "),C" & currentRow & "*J" & currentRow & ",G" & currentRow & ")"
+            End If
+            wsSummary.Cells(currentRow, 11).NumberFormat = "$#,##0.00"
+            wsSummary.Cells(currentRow, 11).Interior.color = RGB(142, 169, 219) ' Blue
+            
+            ' Column L: Final extended (Qty * Final whole sale) - BLUE
+            wsSummary.Cells(currentRow, 12).Formula = "=B" & currentRow & "*K" & currentRow
+            wsSummary.Cells(currentRow, 12).NumberFormat = "$#,##0.00"
+            wsSummary.Cells(currentRow, 12).Interior.color = RGB(142, 169, 219) ' Blue
+            
+            ' Add borders
+            wsSummary.Range(wsSummary.Cells(currentRow, 1), wsSummary.Cells(currentRow, 13)).Borders.LineStyle = xlContinuous
+            
+            ' Only increment row if we wrote data
+            currentRow = currentRow + 1
+        End If
+        ' If avgCost is invalid, skip this grade entirely (no row added to summary)
+    Next variationKey
+    
+    ProcessHeaders1Section = currentRow
+End Function
+
+' Get multiplier based on grade
+Function GetMultiplier(grade As String) As Double
+    ' Clean up the grade string - normalize it
+    grade = NormalizeGrade(grade)
+    
+    ' Check for B GOOD variants
+    If InStr(grade, "B GOOD") > 0 Or grade = "B" Then
+        GetMultiplier = 1.15
+        Exit Function
+    End If
+    
+    ' Check for C(AMZ) variants - MUST check before regular C
+    ' After normalization, "C(AMZ)" becomes "CAMZ"
+    If InStr(grade, "CAMZ") > 0 Or _
+       (InStr(grade, "C") > 0 And InStr(grade, "AMZ") > 0) Then
+        GetMultiplier = 1.15
+        Exit Function
+    End If
+    
+    ' Check for C GOOD variants (but not AMZ)
+    If InStr(grade, "C GOOD") > 0 And InStr(grade, "AMZ") = 0 Then
+        GetMultiplier = 1.05
+        Exit Function
+    End If
+    
+    ' Check for DEFECTIVE variants
+    If InStr(grade, "DEFECTIVE") > 0 Then
+        GetMultiplier = 0.4
+        Exit Function
+    End If
+    
+    ' Check for D GOOD variants
+    If InStr(grade, "D GOOD") > 0 Then
+        GetMultiplier = 0.7
+        Exit Function
+    End If
+    
+    ' Single letter grades (B, C, D)
+    If grade = "B" Then
+        GetMultiplier = 1.15
+        Exit Function
+    End If
+    
+    ' Check for regular C (must be after AMZ check)
+    If grade = "C" Then
+        GetMultiplier = 1.05
+        Exit Function
+    End If
+    
+    If grade = "D" Then
+        GetMultiplier = 0.7
+        Exit Function
+    End If
+    
+    ' If still no match, return 0 and warn
+    GetMultiplier = 0
+    Debug.Print "WARNING: No multiplier defined for grade: """ & grade & """ (original: """ & grade & """)"
+End Function
+
+' Normalize grade string for better matching
+Function NormalizeGrade(grade As String) As String
+    Dim result As String
+    result = Trim(UCase(grade))
+    
+    ' Remove extra spaces
+    Do While InStr(result, "  ") > 0
+        result = Replace(result, "  ", " ")
+    Loop
+    
+    ' Normalize N/A variations
+    result = Replace(result, "N/A", "NA")
+    result = Replace(result, "N A", "NA")
+    result = Replace(result, "N- A", "NA")
+    
+    ' Remove parentheses and spaces within for AMZ
+    result = Replace(result, "(", "")
+    result = Replace(result, ")", "")
+    
+    ' Trim again
+    result = Trim(result)
+    
+    NormalizeGrade = result
+End Function
+
+' Check if battery is not good
+Function IsBatteryDefective(grade As String, batteryHealth As String) As Boolean
+    ' Check if grade indicates defective
+    If InStr(UCase(grade), "DEFECTIVE") > 0 Then
+        IsBatteryDefective = True
+        Exit Function
+    End If
+    
+    ' Check if battery health is below 80% (considered not good)
+    Dim batteryPercent As Double
+    If batteryHealth <> "" And batteryHealth <> "N/A" Then
+        ' Remove % sign and check value
+        batteryHealth = Replace(batteryHealth, "%", "")
+        If IsNumeric(batteryHealth) Then
+            batteryPercent = CDbl(batteryHealth)
+            If batteryPercent < 80 Then
+                IsBatteryDefective = True
+                Exit Function
+            End If
+        End If
+    End If
+    
+    ' Check for specific battery status keywords
+    If InStr(UCase(batteryHealth), "DEFECTIVE") > 0 Or _
+       InStr(UCase(batteryHealth), "BAD") > 0 Or _
+       InStr(UCase(batteryHealth), "FAIL") > 0 Or _
+       batteryHealth = "N/A" And InStr(UCase(grade), "DEFECTIVE") > 0 Then
+        IsBatteryDefective = True
+    Else
+        IsBatteryDefective = False
+    End If
+End Function
+
+' Get grade/battery/color variations for a specific model+storage (all colors included)
+Function GetGradeVariationsForModel(ws As Worksheet, model As String, storage As String) As Collection
+    Dim variations As New Collection
+    Dim lastRow As Long
+    Dim i As Long
+    Dim currentModel As String, currentStorage As String
+    Dim grade As String, battery As String, color As String
+    Dim variationKey As String
+    
+    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    
+    On Error Resume Next
+    For i = 2 To lastRow
+        ' Keep Excel responsive - yield every 50 rows
+        If i Mod 50 = 0 Then DoEvents
+        
+        currentModel = Trim(ws.Cells(i, 2).Value) ' Column B: MODEL
+        currentStorage = ExtractStorage(ws.Cells(i, 3).Value) ' Column C: DESCRIPTION
+        
+        ' Match by Model + Storage only (all colors included in same group)
+        If currentModel = model And currentStorage = storage Then
+            grade = Trim(ws.Cells(i, 7).Value) ' Column G: GRADE
+            battery = Trim(ws.Cells(i, 8).Value) ' Column H: BATTERY HEALTH
+            color = Trim(ws.Cells(i, 11).Value) ' Column K: COLOR
+            
+            ' Include color in the variation key
+            variationKey = grade & "|" & battery & "|" & color
+            variations.Add variationKey, variationKey
+        End If
+    Next i
+    On Error GoTo 0
+    
+    Set GetGradeVariationsForModel = variations
+End Function
+
+' Legacy function kept for compatibility - redirects to new function
+Function GetGradesForModel(ws As Worksheet, model As String, storage As String, color As String) As Collection
+    Set GetGradesForModel = GetGradeVariationsForModel(ws, model, storage)
+End Function
+
+' Get quantity for specific grade/battery/color combination
+Function GetQuantityForGrade(ws As Worksheet, model As String, storage As String, color As String, grade As String, battery As String) As Long
+    Dim lastRow As Long
+    Dim i As Long
+    Dim count As Long
+    Dim currentModel As String, currentStorage As String, currentColor As String
+    Dim currentGrade As String, currentBattery As String
+    
+    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    count = 0
+    
+    For i = 2 To lastRow
+        ' Keep Excel responsive - yield every 50 rows
+        If i Mod 50 = 0 Then DoEvents
+        
+        currentModel = Trim(ws.Cells(i, 2).Value)
+        currentStorage = ExtractStorage(ws.Cells(i, 3).Value)
+        currentColor = Trim(ws.Cells(i, 11).Value)
+        currentGrade = Trim(ws.Cells(i, 7).Value)
+        currentBattery = Trim(ws.Cells(i, 8).Value)
+        
+        If currentModel = model And currentStorage = storage And currentColor = color And _
+           currentGrade = grade And currentBattery = battery Then
+            count = count + 1
+        End If
+    Next i
+    
+    GetQuantityForGrade = count
+End Function
+
+' Rate limiting function - ensures max 2 API calls per second
+Private Sub EnforceRateLimit()
+    Dim now As Double
+    Dim i As Long
+    Dim timestamp As Double
+    Dim callsInLastSecond As Long
+    
+    ' Initialize if not already initialized
+    If apiCallTimestamps Is Nothing Then
+        Set apiCallTimestamps = New Collection
+    End If
+    
+    ' Get current time
+    now = Timer
+    
+    ' Clean up old timestamps (older than 1 second)
+    callsInLastSecond = 0
+    If apiCallTimestamps.count > 0 Then
+        For i = apiCallTimestamps.count To 1 Step -1
+            timestamp = apiCallTimestamps(i)
+            If (now - timestamp) >= 1# Then
+                apiCallTimestamps.Remove i
+            Else
+                callsInLastSecond = callsInLastSecond + 1
+            End If
+        Next i
+    End If
+    
+    ' If we've already made 2 calls in the last second, wait until we can make another
+    If callsInLastSecond >= 2 And apiCallTimestamps.count > 0 Then
+        ' Wait for the oldest call to be more than 1 second old
+        Dim waitTime As Double
+        Dim oldestTimestamp As Double
+        oldestTimestamp = apiCallTimestamps(1)
+        waitTime = 1# - (now - oldestTimestamp)
+        
+        If waitTime > 0 And waitTime < 2 Then
+            ' Add a small buffer to ensure we wait slightly longer
+            waitTime = waitTime + 0.1
+            
+            ' Keep Excel responsive while waiting for rate limit - use DoEvents loop instead of Application.Wait
+            Dim waitStart As Double
+            waitStart = Timer
+            Do While (Timer - waitStart) < waitTime
+                DoEvents  ' Allow user interaction during wait
+            Loop
+            
+            ' Clean up again after waiting
+            now = Timer
+            For i = apiCallTimestamps.count To 1 Step -1
+                timestamp = apiCallTimestamps(i)
+                If (now - timestamp) >= 1# Then
+                    apiCallTimestamps.Remove i
+                End If
+            Next i
+        End If
+    End If
+    
+    ' Record this API call timestamp
+    apiCallTimestamps.Add Timer
+End Sub
+
+' Get average WholeCell cost for a specific model/grade combination
+Function GetWholeCellCostForGrade(ws As Worksheet, model As String, storage As String, color As String, grade As String, battery As String) As Variant
+    Dim lastRow As Long
+    Dim i As Long
+    Dim currentModel As String, currentStorage As String, currentColor As String
+    Dim currentGrade As String, currentBattery As String
+    Dim imei As String
+    Dim costs As Collection
+    Dim cost As Variant
+    Dim totalCost As Double
+    Dim loopCounter As Long
+    
+    Set costs = New Collection
+    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    loopCounter = 0
+    
+    ' Find matching items and fetch their costs from WholeCell
+    For i = 2 To lastRow
+        ' Keep Excel responsive - yield every 10 iterations
+        loopCounter = loopCounter + 1
+        If loopCounter Mod 10 = 0 Then DoEvents
+        currentModel = Trim(ws.Cells(i, 2).Value) ' Column B: MODEL
+        currentStorage = ExtractStorage(ws.Cells(i, 3).Value) ' Column C: DESCRIPTION
+        currentColor = Trim(ws.Cells(i, 11).Value) ' Column K: COLOR
+        currentGrade = Trim(ws.Cells(i, 7).Value) ' Column G: GRADE
+        currentBattery = Trim(ws.Cells(i, 8).Value) ' Column H: BATTERY HEALTH
+        
+        If currentModel = model And currentStorage = storage And currentColor = color And _
+           currentGrade = grade And currentBattery = battery Then
+            ' Get IMEI from Column D
+            imei = Trim(ws.Cells(i, 4).Value)
+            
+            ' Fetch cost from WholeCell using the IMEI (following Module1 safe approach)
+            If Len(imei) > 0 Then
+                totalIMEIsProcessed = totalIMEIsProcessed + 1
+                
+                ' Update status bar with IMEI progress
+                Application.StatusBar = "Looking up IMEI " & totalIMEIsProcessed & ": " & Left(imei, 8) & "..."
+
+                On Error Resume Next
+                ' Check cache first
+                Dim isCached As Boolean
+                isCached = costCache.Exists(imei)
+
+                If isCached Then
+                    cost = costCache(imei)
+                Else
+                    ' Enforce rate limit before making API call (max 2 calls per second)
+                    EnforceRateLimit
+
+                    ' Fetch from WholeCell using Module1's safe approach
+                    Dim dict As Object
+                    Set dict = FetchWithRetry(imei, 2) ' 2 retries like Module1
+                    
+                    ' Keep Excel responsive after API call
+                    DoEvents
+
+                    If Not dict Is Nothing Then
+                        If CBool(Nz(dict("success"), False)) Then
+                            cost = CDbl0(dict("universalUsd")) ' Safe conversion like Module1
+                            If cost > 0 Then
+                                costCache.Add imei, cost
+                            End If
+                        Else
+                            cost = 0 ' Failed fetch
+                        End If
+                    Else
+                        cost = 0 ' No response
+                    End If
+                End If
+                On Error GoTo 0
+                ' check if the module is there
+                ' Track statistics using safe conversion (like Module1)
+                If CDbl0(cost) > 0 Then
+                    costs.Add cost
+                    totalIMEIsFound = totalIMEIsFound + 1
+                Else
+                    totalIMEIsNotFound = totalIMEIsNotFound + 1
+                End If
+            End If
+        End If
+    Next i
+    
+    ' Calculate average cost - NO FALLBACK, return error if no valid prices
+    If costs.count > 0 Then
+        totalCost = 0
+        For i = 1 To costs.count
+            totalCost = totalCost + costs(i)
+        Next i
+        GetWholeCellCostForGrade = totalCost / costs.count
+    Else
+        ' Return an error value if no costs found - NO $70 FALLBACK
+        GetWholeCellCostForGrade = CVErr(xlErrNA)
+    End If
+End Function
+
+' Process Headers2 section (summary) - now shows "Model + Storage" as the differentiator
+Function ProcessHeaders2Section(wsSummary As Worksheet, startRow As Long) As Long
+    Dim currentRow As Long
+    Dim firstDataRow As Long
+    Dim lastDataRow As Long
+    
+    currentRow = startRow
+    
+    ' Find the first data row (after Headers1)
+    firstDataRow = startRow - ProcessHeaders1DataRowCount(wsSummary, startRow)
+    lastDataRow = startRow - 1
+    
+    ' Write Headers2 - Column A now says "Model + Storage" as it's the differentiator
+    wsSummary.Cells(currentRow, 1).Value = "Model + Storage"
+    wsSummary.Cells(currentRow, 2).Value = ""
+    wsSummary.Cells(currentRow, 3).Value = "Average Cost"
+    wsSummary.Cells(currentRow, 4).Value = "Extended Cost"
+    wsSummary.Cells(currentRow, 5).Value = ""
+    wsSummary.Cells(currentRow, 6).Value = "Suggested wholesale"
+    wsSummary.Cells(currentRow, 7).Value = "Clear Rate"
+    wsSummary.Cells(currentRow, 8).Value = "Suggested Extended"
+    wsSummary.Cells(currentRow, 9).Value = ""
+    wsSummary.Cells(currentRow, 10).Value = "Final Wholesale"
+    wsSummary.Cells(currentRow, 11).Value = "Clear Rate"
+    wsSummary.Cells(currentRow, 12).Value = "Final Extended"
+    wsSummary.Cells(currentRow, 13).Value = "" ' Empty for notes column
+    
+    ' Format header row - ORANGE for Headers2
+    With wsSummary.Range(wsSummary.Cells(currentRow, 1), wsSummary.Cells(currentRow, 13))
+        .Interior.color = RGB(255, 192, 0) ' Orange background
+        .Borders.LineStyle = xlContinuous
+    End With
+    
+    currentRow = currentRow + 1
+    
+    ' Extract Model + Storage from first data row (e.g., "IPAD 6 WIFI 128 GB")
+    Dim modelStorageInfo As String
+    modelStorageInfo = ExtractModelStorage(wsSummary.Cells(firstDataRow, 1).Value)
+    
+    ' Row 1 of Headers2 data - shows Model + Storage (e.g., "IPAD 6 WIFI 128 GB")
+    wsSummary.Cells(currentRow, 1).Value = modelStorageInfo
+    
+    ' Total Qty (sum of all quantities)
+    wsSummary.Cells(currentRow, 2).Formula = "=SUM(B" & firstDataRow & ":B" & lastDataRow & ")"
+    
+    ' Average Cost
+    wsSummary.Cells(currentRow, 3).Formula = "=AVERAGE(C" & firstDataRow & ":C" & lastDataRow & ")"
+    wsSummary.Cells(currentRow, 3).NumberFormat = "$#,##0.00"
+    
+    ' Extended Cost
+    wsSummary.Cells(currentRow, 4).Formula = "=SUM(D" & firstDataRow & ":D" & lastDataRow & ")"
+    wsSummary.Cells(currentRow, 4).NumberFormat = "$#,##0.00"
+    
+    ' Suggested wholesale (weighted average)
+    wsSummary.Cells(currentRow, 6).Formula = "=SUMPRODUCT(G" & firstDataRow & ":G" & lastDataRow & ",B" & firstDataRow & ":B" & lastDataRow & ")/SUM(B" & firstDataRow & ":B" & lastDataRow & ")"
+    wsSummary.Cells(currentRow, 6).NumberFormat = "$#,##0.00"
+    
+    ' Clear Rate for Suggested
+    wsSummary.Cells(currentRow, 7).Formula = "=F" & currentRow & "/C" & currentRow
+    wsSummary.Cells(currentRow, 7).NumberFormat = "0.00%"
+    
+    ' Suggested Extended
+    wsSummary.Cells(currentRow, 8).Formula = "=SUM(H" & firstDataRow & ":H" & lastDataRow & ")"
+    wsSummary.Cells(currentRow, 8).NumberFormat = "$#,##0.00"
+    
+    ' Final Wholesale (weighted average)
+    wsSummary.Cells(currentRow, 10).Formula = "=SUMPRODUCT(K" & firstDataRow & ":K" & lastDataRow & ",B" & firstDataRow & ":B" & lastDataRow & ")/SUM(B" & firstDataRow & ":B" & lastDataRow & ")"
+    wsSummary.Cells(currentRow, 10).NumberFormat = "$#,##0.00"
+    
+    ' Clear Rate for Final
+    wsSummary.Cells(currentRow, 11).Formula = "=J" & currentRow & "/C" & currentRow
+    wsSummary.Cells(currentRow, 11).NumberFormat = "0.00%"
+    
+    ' Final Extended
+    wsSummary.Cells(currentRow, 12).Formula = "=SUM(L" & firstDataRow & ":L" & lastDataRow & ")"
+    wsSummary.Cells(currentRow, 12).NumberFormat = "$#,##0.00"
+    
+    ' Add borders and formatting - ORANGE for Headers2 data rows
+    With wsSummary.Range(wsSummary.Cells(currentRow, 1), wsSummary.Cells(currentRow, 13))
+        .Borders.LineStyle = xlContinuous
+        .Interior.color = RGB(255, 192, 0) ' Orange background for Headers2 data
+    End With
+    
+    currentRow = currentRow + 1
+    
+    ProcessHeaders2Section = currentRow
+End Function
+
+' Extract Model + Storage from the full string (e.g., "IPAD 6 WIFI 128GB" from "IPAD 6 WIFI 128GB 85% B GOOD Space Gray")
+Function ExtractModelStorage(fullString As String) As String
+    Dim parts() As String
+    Dim result As String
+    Dim i As Long
+    Dim foundStorage As Boolean
+    
+    parts = Split(fullString, " ")
+    result = ""
+    foundStorage = False
+    
+    ' Build string until we find the storage (ends with GB)
+    For i = 0 To UBound(parts)
+        result = result & parts(i)
+        
+        ' Check if this part contains the storage (e.g., "128GB")
+        If UCase(parts(i)) Like "*GB" Then
+            foundStorage = True
+            Exit For
+        End If
+        
+        result = result & " "
+    Next i
+    
+    ' If we didn't find storage, return first 3 parts as fallback
+    If Not foundStorage Then
+        If UBound(parts) >= 2 Then
+            result = parts(0) & " " & parts(1) & " " & parts(2)
+        Else
+            result = fullString
+        End If
+    End If
+    
+    ExtractModelStorage = Trim(result)
+End Function
+
+' Legacy function kept for compatibility
+Function ExtractModelStorageColor(fullString As String) As String
+    ExtractModelStorageColor = ExtractModelStorage(fullString)
+End Function
+
+' Count data rows in Headers1 section
+Function ProcessHeaders1DataRowCount(ws As Worksheet, currentRow As Long) As Long
+    Dim count As Long
+    Dim i As Long
+    
+    count = 0
+    For i = currentRow - 1 To 1 Step -1
+        If ws.Cells(i, 1).Value Like "*Model + Storage*" Then
+            Exit For
+        End If
+        If ws.Cells(i, 1).Value <> "" Then
+            count = count + 1
+        End If
+    Next i
+    
+    ProcessHeaders1DataRowCount = count
+End Function
+
+' Format the entire summary sheet
+Sub FormatSummarySheet(ws As Worksheet)
+    ' Keep Excel responsive during formatting
+    DoEvents
+    
+    ' Auto-fit columns
+    ws.Columns("A:M").AutoFit
+    
+    ' Set column widths (increased to be wider)
+    ws.Columns("A").ColumnWidth = 55
+    ws.Columns("B").ColumnWidth = 12
+    ws.Columns("C:D").ColumnWidth = 18
+    ws.Columns("E").ColumnWidth = 8
+    ws.Columns("F").ColumnWidth = 14
+    ws.Columns("G:H").ColumnWidth = 18
+    ws.Columns("I").ColumnWidth = 8
+    ws.Columns("J").ColumnWidth = 18
+    ws.Columns("K:L").ColumnWidth = 18
+    ws.Columns("M").ColumnWidth = 55 ' Notes column for battery deductions
+    ws.Columns("N").ColumnWidth = 0.1 ' Hide column N (used for battery status)
+    ws.Columns("N").Hidden = True ' Hide it completely
+    
+    ' Freeze panes at row 2
+    ws.Activate
+    ws.Range("A2").Select
+    ActiveWindow.FreezePanes = True
+    
+    ' Add sheet title
+    ws.Range("A1").Select
+End Sub
+
+' ===================================
+' BUTTON SETUP FOR MANIFEST SHEET
+' ===================================
+' Run this ONCE to add the "Generate Pricing Summary" button to MANIFEST sheet
+Sub AddButtonToManifest()
+    Dim ws As Worksheet
+    Dim btn As Object
+    Dim btnRange As Range
+    
+    ' Ensure we're adding button to MANIFEST sheet
+    On Error Resume Next
+    Set ws = ActiveWorkbook.Sheets("MANIFEST")
+    If ws Is Nothing Then
+        MsgBox "MANIFEST sheet not found! Please create MANIFEST sheet first.", vbExclamation
+        Exit Sub
+    End If
+    On Error GoTo 0
+    
+    ' Activate MANIFEST sheet
+    ws.Activate
+    
+    ' Delete existing button if present
+    On Error Resume Next
+    ws.Shapes("btnGenerateSummary").Delete
+    On Error GoTo 0
+    
+    ' Place button in a visible location (adjust as needed)
+    ' This example places it in the top right area (column M, row 2)
+    Set btnRange = ws.Range("M2:O3")
+    
+    ' Add button to MANIFEST sheet
+    Set btn = ws.Buttons.Add(btnRange.Left, btnRange.Top, btnRange.Width, btnRange.Height)
+    
+    With btn
+        .Name = "btnGenerateSummary"
+        .Caption = "Generate Pricing Summary"
+        .OnAction = "GeneratePricingSummary"
+        .Font.Bold = True
+        .Font.Size = 11
+    End With
+    
+    ' Add instructions near the button
+    ws.Range("M1").Value = "Click to generate summary:"
+    ws.Range("M1").Font.Bold = True
+    ws.Range("M1").Font.color = RGB(0, 0, 200)
+    
+    MsgBox "Button successfully added to MANIFEST sheet!" & vbNewLine & _
+           vbNewLine & _
+           "Instructions:" & vbNewLine & _
+           "1. Enter all your data in the MANIFEST sheet" & vbNewLine & _
+           "2. Click the 'Generate Pricing Summary' button" & vbNewLine & _
+           "3. The summary will be created in a new sheet", _
+           vbInformation, "Setup Complete"
+End Sub
+
+' Alternative: Add button to ribbon or Quick Access Toolbar
+Sub AddToQuickAccess()
+    MsgBox "To add to Quick Access Toolbar:" & vbNewLine & _
+           "1. Right-click the Quick Access Toolbar" & vbNewLine & _
+           "2. Choose 'Customize Quick Access Toolbar'" & vbNewLine & _
+           "3. Choose 'Macros' from the dropdown" & vbNewLine & _
+           "4. Select 'GeneratePricingSummary'" & vbNewLine & _
+           "5. Click 'Add' and then 'OK'", _
+           vbInformation, "Quick Access Setup"
+End Sub
+
+' Set up event handler for summary sheet
+Sub SetupSummarySheetEventHandler()
+    On Error Resume Next
+    Dim wsSummary As Worksheet
+    Set wsSummary = ActiveWorkbook.Sheets("Summary of pricing")
+    If wsSummary Is Nothing Then Exit Sub
+    On Error GoTo 0
+    
+    ' Store a flag in the worksheet to indicate the handler is set up
+    wsSummary.Cells(1, 14).Value = "EVENT_HANDLER_INSTALLED"
+    wsSummary.Cells(1, 14).Font.color = wsSummary.Cells(1, 14).Interior.color ' Make invisible
+End Sub
+
+' ===================================
+' WORKSHEET CHANGE EVENT HANDLER
+' ===================================
+' This must be placed in the worksheet module (Sheet object code)
+' For now, we'll add it here and instruct the user to copy it
+
+Private Sub Worksheet_Change_Handler(ByVal Target As Range)
+    ' Handle changes in the summary sheet for linked columns J, K, L
+    Dim ws As Worksheet
+    Dim affectedRow As Long
+    
+    ' Only handle changes in the Summary of pricing sheet
+    On Error Resume Next
+    Set ws = ActiveWorkbook.Sheets("Summary of pricing")
+    If ws Is Nothing Then Exit Sub
+    
+    ' Check if target is in columns J (10), K (11), or L (12)
+    If Intersect(Target, ws.Range("J:L")) Is Nothing Then Exit Sub
+    
+    affectedRow = Target.Row
+    
+    ' Don't process header rows
+    If ws.Cells(affectedRow, 1).Value = "" Or _
+       ws.Cells(affectedRow, 1).Value Like "*Model + Storage*" Then Exit Sub
+    
+    ' Keep ScreenUpdating ON for responsiveness
+    Application.EnableEvents = False
+    
+    On Error GoTo ErrorHandler
+    
+    Dim colChanged As Integer
+    colChanged = Target.Column
+    
+    Dim cost As Double, qty As Double, kValue As Double, jValue As Double, lValue As Double
+    Dim hasBadBattery As Boolean
+    Dim batteryDeduction As Double
+    
+    ' Check if battery has issues (from column N)
+    hasBadBattery = (ws.Cells(affectedRow, 14).Value = "BAD_BATTERY")
+    batteryDeduction = IIf(hasBadBattery, 15, 0)
+    
+    cost = CDbl0(ws.Cells(affectedRow, 3).Value) ' Column C: Cost
+    qty = CDbl0(ws.Cells(affectedRow, 2).Value)  ' Column B: Qty
+    
+    Select Case colChanged
+        Case 10 ' Column J (Free hand Multiplier)
+            jValue = CDbl0(Target.Value)
+            If jValue > 0 And cost > 0 Then
+                ' Calculate K: Final wholesale = Cost * J - Battery Deduction
+                kValue = (cost * jValue) - batteryDeduction
+                ws.Cells(affectedRow, 11).Value = kValue
+                
+                ' Calculate L: Final extended = Qty * K
+                lValue = qty * kValue
+                ws.Cells(affectedRow, 12).Value = lValue
+            End If
+            
+        Case 11 ' Column K (Final wholesale)
+            kValue = CDbl0(Target.Value)
+            If cost > 0 Then
+                ' Calculate J: Free hand Multiplier = (K + Battery Deduction) / Cost
+                jValue = (kValue + batteryDeduction) / cost
+                ws.Cells(affectedRow, 10).Value = jValue
+                
+                ' Calculate L: Final extended = Qty * K
+                lValue = qty * kValue
+                ws.Cells(affectedRow, 12).Value = lValue
+            End If
+            
+        Case 12 ' Column L (Final extended)
+            lValue = CDbl0(Target.Value)
+            If qty > 0 Then
+                ' Calculate K: Final wholesale = L / Qty
+                kValue = lValue / qty
+                ws.Cells(affectedRow, 11).Value = kValue
+                
+                ' Calculate J: Free hand Multiplier = (K + Battery Deduction) / Cost
+                If cost > 0 Then
+                    jValue = (kValue + batteryDeduction) / cost
+                    ws.Cells(affectedRow, 10).Value = jValue
+                End If
+            End If
+    End Select
+    
+ErrorHandler:
+    Application.EnableEvents = True
+End Sub
+
+' ===================================
+' IMPORTANT INSTRUCTIONS
+' ===================================
+' The Worksheet_Change_Handler above MUST be copied to the worksheet module
+' To install this handler:
+' 1. Open the workbook
+' 2. Right-click on "Summary of pricing" sheet tab
+' 3. Click "View Code"
+' 4. Paste the following code into that module:
+'
+' Private Sub Worksheet_Change(ByVal Target As Range)
+'     ' Handle changes in the summary sheet for linked columns J, K, L
+'     Dim affectedRow As Long
+'
+'     ' Check if target is in columns J (10), K (11), or L (12)
+'     If Intersect(Target, Me.Range("J:L")) Is Nothing Then Exit Sub
+'
+'     affectedRow = Target.Row
+'
+'     ' Don't process header rows
+'     If Me.Cells(affectedRow, 1).Value = "" Or _
+'        Me.Cells(affectedRow, 1).Value Like "*Model + Storage*" Then Exit Sub
+'
+'     ' Keep ScreenUpdating ON for responsiveness
+'     Application.EnableEvents = False
+'
+'     On Error GoTo ErrorHandler
+'
+'     Dim colChanged As Integer
+'     colChanged = Target.Column
+'
+'     Dim cost As Double, qty As Double, kValue As Double, jValue As Double, lValue As Double
+'     Dim hasBadBattery As Boolean
+'     Dim batteryDeduction As Double
+'
+'     ' Check if battery has issues (from column N - hidden column)
+'     hasBadBattery = (Me.Cells(affectedRow, 14).Value = "BAD_BATTERY")
+'     batteryDeduction = IIf(hasBadBattery, 15, 0)
+'
+'     cost = Me.Cells(affectedRow, 3).Value ' Column C: Cost
+'     qty = Me.Cells(affectedRow, 2).Value  ' Column B: Qty
+'
+'     Select Case colChanged
+'         Case 10 ' Column J (Free hand Multiplier)
+'             On Error Resume Next
+'             jValue = CDbl(Target.Value)
+'             If Err.Number <> 0 Then jValue = 0
+'             On Error GoTo 0
+'             If jValue > 0 And cost > 0 Then
+'                 ' Calculate K: Final wholesale = Cost * J - Battery Deduction
+'                 kValue = (cost * jValue) - batteryDeduction
+'                 Me.Cells(affectedRow, 11).Value = kValue
+'
+'                 ' Calculate L: Final extended = Qty * K
+'                 lValue = qty * kValue
+'                 Me.Cells(affectedRow, 12).Value = lValue
+'             End If
+'
+'         Case 11 ' Column K (Final wholesale)
+'             On Error Resume Next
+'             kValue = CDbl(Target.Value)
+'             If Err.Number <> 0 Then kValue = 0
+'             On Error GoTo 0
+'             If cost > 0 Then
+'                 ' Calculate J: Free hand Multiplier = (K + Battery Deduction) / Cost
+'                 jValue = (kValue + batteryDeduction) / cost
+'                 Me.Cells(affectedRow, 10).Value = jValue
+'
+'                 ' Calculate L: Final extended = Qty * K
+'                 lValue = qty * kValue
+'                 Me.Cells(affectedRow, 12).Value = lValue
+'             End If
+'
+'         Case 12 ' Column L (Final extended)
+'             On Error Resume Next
+'             lValue = CDbl(Target.Value)
+'             If Err.Number <> 0 Then lValue = 0
+'             On Error GoTo 0
+'             If qty > 0 Then
+'                 ' Calculate K: Final wholesale = L / Qty
+'                 kValue = lValue / qty
+'                 Me.Cells(affectedRow, 11).Value = kValue
+'
+'                 ' Calculate J: Free hand Multiplier = (K + Battery Deduction) / Cost
+'                 If cost > 0 Then
+'                     jValue = (kValue + batteryDeduction) / cost
+'                     Me.Cells(affectedRow, 10).Value = jValue
+'                 End If
+'             End If
+'     End Select
+'
+' ErrorHandler:
+'     Application.EnableEvents = True
+' End Sub
+'
+' 5. Save the workbook as .xlsm (macro-enabled workbook)
+
